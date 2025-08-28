@@ -3,6 +3,7 @@ from threading import Thread
 import os
 from discord.ext import commands, tasks
 import discord
+discord.opus = None
 import random
 import requests
 import asyncio
