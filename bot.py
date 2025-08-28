@@ -10,7 +10,7 @@ import random
 import requests
 import asyncio
 import logging
-import aiohttp  # ✅ added
+import aiohttp
 
 # === Keep-alive server ===
 app = Flask(__name__)
@@ -34,18 +34,14 @@ class MilestoneBot:
         self.token = token
         self.place_id = str(place_id)
 
-        # === Proxy (Webshare) ===
-        self.proxy = "http://vwxsdkhx:6ugt3ma40e63@23.95.150.145:6114"
-
         # Intents
         intents = discord.Intents.none()
         intents.guilds = True
         intents.messages = True
         intents.message_content = True
 
-        # Bot + proxy
+        # Bot
         self.bot = commands.Bot(command_prefix='!', intents=intents)
-        self.bot.http.proxy = self.proxy   # ✅ Discord via proxy
 
         self.target_channel: discord.TextChannel | None = None
         self.is_running = False
@@ -62,20 +58,29 @@ class MilestoneBot:
         # background loop
         self.milestone_loop = tasks.loop(seconds=65)(self._milestone_loop_body)
 
-        # Requests session + proxy
+        # Requests session (NO proxy now)
         self._http = requests.Session()
         self._http.headers.update({"User-Agent": "Mozilla/5.0 (MilestoneBot)"})
-        self._http.proxies.update({
-            "http": self.proxy,
-            "https": self.proxy,
-        })
 
-        # aiohttp session + proxy
+        # aiohttp session (NO proxy now)
         connector = aiohttp.TCPConnector()
         self._aiohttp = aiohttp.ClientSession(connector=connector)
 
         # ✅ Add shutdown handler
         self.bot.add_listener(self.on_close)
+
+        # ✅ Rate-limit variables
+        self._last_request = 0
+        self._min_delay = 2.0  # seconds between API calls
+
+    async def safe_api_call(self, coro):
+        """Prevent spamming API calls (Discord + Roblox)."""
+        now = asyncio.get_event_loop().time()
+        wait = self._min_delay - (now - self._last_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_request = asyncio.get_event_loop().time()
+        return await coro
 
     async def on_ready(self):
         logging.info(f'Bot logged in as {self.bot.user}')
@@ -96,15 +101,15 @@ class MilestoneBot:
         async def start_milestone(ctx: commands.Context):
             if self.is_running:
                 if self.target_channel and self.target_channel.id != ctx.channel.id:
-                    await ctx.send(f"Already running in {self.target_channel.mention}. Use `!stopms` there first.")
+                    await self.safe_api_call(ctx.send(f"Already running in {self.target_channel.mention}. Use `!stopms` there first."))
                 else:
-                    await ctx.send("Bot is already running!")
+                    await self.safe_api_call(ctx.send("Bot is already running!"))
                 return
 
             self.target_channel = ctx.channel
             self.is_running = True
 
-            await ctx.send("Milestone bot started ✅")
+            await self.safe_api_call(ctx.send("Milestone bot started ✅"))
             await self.send_milestone_update()
             if not self.milestone_loop.is_running():
                 self.milestone_loop.start()
@@ -112,33 +117,33 @@ class MilestoneBot:
         @self.bot.command(name='stopms')
         async def stop_milestone(ctx: commands.Context):
             if not self.is_running:
-                await ctx.send("Bot is not running!")
+                await self.safe_api_call(ctx.send("Bot is not running!"))
                 return
             self.is_running = False
             if self.milestone_loop.is_running():
                 self.milestone_loop.cancel()
-            await ctx.send("Milestone bot stopped ⏹️")
+            await self.safe_api_call(ctx.send("Milestone bot stopped ⏹️"))
 
         @self.bot.command(name='setgoal')
         async def set_goal(ctx: commands.Context, goal: int):
             if goal < 0:
-                await ctx.send("Goal must be a positive number.")
+                await self.safe_api_call(ctx.send("Goal must be a positive number."))
                 return
             self.milestone_goal = goal
-            await ctx.send(f"Milestone goal set to **{goal:,}**")
+            await self.safe_api_call(ctx.send(f"Milestone goal set to **{goal:,}**"))
 
         @self.bot.command(name='status')
         async def status(ctx: commands.Context):
             players, visits = await asyncio.to_thread(self.get_game_data)
-            await ctx.send(
+            await self.safe_api_call(ctx.send(
                 f"Players: **{players}** | Visits: **{visits:,}** | Next goal: **{self.milestone_goal:,}**"
-            )
+            ))
 
         @self.bot.event
         async def on_command_error(ctx: commands.Context, error: Exception):
             logging.error(f"Command error: {error}")
             try:
-                await ctx.send(f"⚠️ {type(error).__name__}: {error}")
+                await self.safe_api_call(ctx.send(f"⚠️ {type(error).__name__}: {error}"))
             except Exception:
                 pass
 
@@ -205,7 +210,7 @@ class MilestoneBot:
             "--------------------------------------------------"
         )
         try:
-            await self.target_channel.send(message)
+            await self.safe_api_call(self.target_channel.send(message))
         except Exception as e:
             logging.error(f"Failed to send Discord message: {e}")
 
