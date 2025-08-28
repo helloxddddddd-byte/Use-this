@@ -1,3 +1,5 @@
+import sys
+print(">>> PYTHON VERSION:", sys.version)
 from flask import Flask
 from threading import Thread
 import os
