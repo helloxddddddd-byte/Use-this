@@ -10,6 +10,7 @@ import random
 import requests
 import asyncio
 import logging
+import time
 import aiohttp
 
 # === Keep-alive server ===
@@ -27,6 +28,21 @@ def run_flask():
 def keep_alive():
     t = Thread(target=run_flask, daemon=True)
     t.start()
+
+# === Global rate limiter ===
+_last_request = 0
+_rate_limit = 5  # seconds between requests
+
+def limited_request(session, url, **kwargs):
+    """Global rate-limited request wrapper"""
+    global _last_request
+    elapsed = time.time() - _last_request
+    if elapsed < _rate_limit:
+        sleep_for = _rate_limit - elapsed
+        time.sleep(sleep_for)
+    resp = session.get(url, **kwargs)
+    _last_request = time.time()
+    return resp
 
 # === Discord Bot ===
 class MilestoneBot:
@@ -58,29 +74,15 @@ class MilestoneBot:
         # background loop
         self.milestone_loop = tasks.loop(seconds=65)(self._milestone_loop_body)
 
-        # Requests session (NO proxy now)
+        # Requests session
         self._http = requests.Session()
         self._http.headers.update({"User-Agent": "Mozilla/5.0 (MilestoneBot)"})
 
-        # aiohttp session (NO proxy now)
+        # aiohttp session
         connector = aiohttp.TCPConnector()
         self._aiohttp = aiohttp.ClientSession(connector=connector)
 
-        # ✅ Add shutdown handler
         self.bot.add_listener(self.on_close)
-
-        # ✅ Rate-limit variables
-        self._last_request = 0
-        self._min_delay = 2.0  # seconds between API calls
-
-    async def safe_api_call(self, coro):
-        """Prevent spamming API calls (Discord + Roblox)."""
-        now = asyncio.get_event_loop().time()
-        wait = self._min_delay - (now - self._last_request)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self._last_request = asyncio.get_event_loop().time()
-        return await coro
 
     async def on_ready(self):
         logging.info(f'Bot logged in as {self.bot.user}')
@@ -90,26 +92,23 @@ class MilestoneBot:
             pass
 
     async def on_close(self, *args):
-        """Clean up sessions on shutdown"""
-        logging.info("Closing aiohttp session...")
         if not self._aiohttp.closed:
             await self._aiohttp.close()
-        logging.info("Shutdown complete ✅")
 
     def setup_commands(self):
         @self.bot.command(name='startms')
         async def start_milestone(ctx: commands.Context):
             if self.is_running:
                 if self.target_channel and self.target_channel.id != ctx.channel.id:
-                    await self.safe_api_call(ctx.send(f"Already running in {self.target_channel.mention}. Use `!stopms` there first."))
+                    await ctx.send(f"Already running in {self.target_channel.mention}. Use `!stopms` there first.")
                 else:
-                    await self.safe_api_call(ctx.send("Bot is already running!"))
+                    await ctx.send("Bot is already running!")
                 return
 
             self.target_channel = ctx.channel
             self.is_running = True
 
-            await self.safe_api_call(ctx.send("Milestone bot started ✅"))
+            await ctx.send("Milestone bot started ✅")
             await self.send_milestone_update()
             if not self.milestone_loop.is_running():
                 self.milestone_loop.start()
@@ -117,33 +116,33 @@ class MilestoneBot:
         @self.bot.command(name='stopms')
         async def stop_milestone(ctx: commands.Context):
             if not self.is_running:
-                await self.safe_api_call(ctx.send("Bot is not running!"))
+                await ctx.send("Bot is not running!")
                 return
             self.is_running = False
             if self.milestone_loop.is_running():
                 self.milestone_loop.cancel()
-            await self.safe_api_call(ctx.send("Milestone bot stopped ⏹️"))
+            await ctx.send("Milestone bot stopped ⏹️")
 
         @self.bot.command(name='setgoal')
         async def set_goal(ctx: commands.Context, goal: int):
             if goal < 0:
-                await self.safe_api_call(ctx.send("Goal must be a positive number."))
+                await ctx.send("Goal must be a positive number.")
                 return
             self.milestone_goal = goal
-            await self.safe_api_call(ctx.send(f"Milestone goal set to **{goal:,}**"))
+            await ctx.send(f"Milestone goal set to **{goal:,}**")
 
         @self.bot.command(name='status')
         async def status(ctx: commands.Context):
             players, visits = await asyncio.to_thread(self.get_game_data)
-            await self.safe_api_call(ctx.send(
+            await ctx.send(
                 f"Players: **{players}** | Visits: **{visits:,}** | Next goal: **{self.milestone_goal:,}**"
-            ))
+            )
 
         @self.bot.event
         async def on_command_error(ctx: commands.Context, error: Exception):
             logging.error(f"Command error: {error}")
             try:
-                await self.safe_api_call(ctx.send(f"⚠️ {type(error).__name__}: {error}"))
+                await ctx.send(f"⚠️ {type(error).__name__}: {error}")
             except Exception:
                 pass
 
@@ -152,16 +151,22 @@ class MilestoneBot:
         visits = self.current_visits
 
         try:
-            universe_resp = self._http.get(
-                f"https://apis.roblox.com/universes/v1/places/{self.place_id}/universe", timeout=10
+            # Step 1: Get universe ID
+            universe_resp = limited_request(
+                self._http,
+                f"https://apis.roblox.com/universes/v1/places/{self.place_id}/universe",
+                timeout=10
             )
             universe_resp.raise_for_status()
             universe_id = universe_resp.json().get("universeId")
             if not universe_id:
                 raise RuntimeError("Cannot get universe ID")
 
-            game_resp = self._http.get(
-                f"https://games.roblox.com/v1/games?universeIds={universe_id}", timeout=10
+            # Step 2: Get game visits
+            game_resp = limited_request(
+                self._http,
+                f"https://games.roblox.com/v1/games?universeIds={universe_id}",
+                timeout=10
             )
             game_resp.raise_for_status()
             data = game_resp.json().get("data", [])
@@ -172,16 +177,19 @@ class MilestoneBot:
 
             self.current_visits = max(self.current_visits, visits)
 
+            # Step 3: Get servers
             cursor = ""
             while True:
                 servers_url = f"https://games.roblox.com/v1/games/{self.place_id}/servers/Public?sortOrder=Asc&limit=100"
                 if cursor:
                     servers_url += f"&cursor={cursor}"
-                server_resp = self._http.get(servers_url, timeout=10)
+
+                server_resp = limited_request(self._http, servers_url, timeout=10)
                 server_resp.raise_for_status()
                 server_data = server_resp.json()
                 data_list = server_data.get("data", [])
                 total_players += sum(int(s.get("playing", 0) or 0) for s in data_list)
+
                 cursor = server_data.get("nextPageCursor")
                 if not cursor:
                     break
@@ -210,7 +218,7 @@ class MilestoneBot:
             "--------------------------------------------------"
         )
         try:
-            await self.safe_api_call(self.target_channel.send(message))
+            await self.target_channel.send(message)
         except Exception as e:
             logging.error(f"Failed to send Discord message: {e}")
 
