@@ -10,6 +10,7 @@ import random
 import requests
 import asyncio
 import logging
+import aiohttp  # ✅ added
 
 # === Keep-alive server ===
 app = Flask(__name__)
@@ -33,13 +34,18 @@ class MilestoneBot:
         self.token = token
         self.place_id = str(place_id)
 
-        # Intents: only what we need; message_content is required for commands in discord.py 2.x
+        # === Proxy (Webshare) ===
+        self.proxy = "http://vwxsdkhx:6ugt3ma40e63@23.95.150.145:6114"
+
+        # Intents
         intents = discord.Intents.none()
         intents.guilds = True
         intents.messages = True
         intents.message_content = True
 
+        # Bot + proxy
         self.bot = commands.Bot(command_prefix='!', intents=intents)
+        self.bot.http.proxy = self.proxy   # ✅ Discord via proxy
 
         self.target_channel: discord.TextChannel | None = None
         self.is_running = False
@@ -53,12 +59,23 @@ class MilestoneBot:
         self.bot.add_listener(self.on_ready)
         self.setup_commands()
 
-        # background loop (created once, started/stopped via commands)
+        # background loop
         self.milestone_loop = tasks.loop(seconds=65)(self._milestone_loop_body)
 
-        # single shared Requests session (slightly faster, fewer TCP handshakes)
+        # Requests session + proxy
         self._http = requests.Session()
         self._http.headers.update({"User-Agent": "Mozilla/5.0 (MilestoneBot)"})
+        self._http.proxies.update({
+            "http": self.proxy,
+            "https": self.proxy,
+        })
+
+        # aiohttp session + proxy
+        connector = aiohttp.TCPConnector()
+        self._aiohttp = aiohttp.ClientSession(connector=connector)
+
+        # ✅ Add shutdown handler
+        self.bot.add_listener(self.on_close)
 
     async def on_ready(self):
         logging.info(f'Bot logged in as {self.bot.user}')
@@ -67,10 +84,16 @@ class MilestoneBot:
         except Exception:
             pass
 
+    async def on_close(self, *args):
+        """Clean up sessions on shutdown"""
+        logging.info("Closing aiohttp session...")
+        if not self._aiohttp.closed:
+            await self._aiohttp.close()
+        logging.info("Shutdown complete ✅")
+
     def setup_commands(self):
         @self.bot.command(name='startms')
         async def start_milestone(ctx: commands.Context):
-            # if already running elsewhere, don't split updates
             if self.is_running:
                 if self.target_channel and self.target_channel.id != ctx.channel.id:
                     await ctx.send(f"Already running in {self.target_channel.mention}. Use `!stopms` there first.")
@@ -82,7 +105,7 @@ class MilestoneBot:
             self.is_running = True
 
             await ctx.send("Milestone bot started ✅")
-            await self.send_milestone_update()  # immediate first update
+            await self.send_milestone_update()
             if not self.milestone_loop.is_running():
                 self.milestone_loop.start()
 
@@ -106,7 +129,7 @@ class MilestoneBot:
 
         @self.bot.command(name='status')
         async def status(ctx: commands.Context):
-            players, visits = await asyncio.to_thread(self.get_game_data)  # non-blocking
+            players, visits = await asyncio.to_thread(self.get_game_data)
             await ctx.send(
                 f"Players: **{players}** | Visits: **{visits:,}** | Next goal: **{self.milestone_goal:,}**"
             )
@@ -119,14 +142,11 @@ class MilestoneBot:
             except Exception:
                 pass
 
-    # === Network work kept sync, but called via asyncio.to_thread to avoid blocking the event loop ===
     def get_game_data(self) -> tuple[int, int]:
-        """Fetch total players and total visits safely with fallbacks."""
         total_players = 0
         visits = self.current_visits
 
         try:
-            # Universe ID from placeId
             universe_resp = self._http.get(
                 f"https://apis.roblox.com/universes/v1/places/{self.place_id}/universe", timeout=10
             )
@@ -135,7 +155,6 @@ class MilestoneBot:
             if not universe_id:
                 raise RuntimeError("Cannot get universe ID")
 
-            # Visits from universe
             game_resp = self._http.get(
                 f"https://games.roblox.com/v1/games?universeIds={universe_id}", timeout=10
             )
@@ -146,10 +165,8 @@ class MilestoneBot:
                 if isinstance(api_visits, int) and api_visits >= 0:
                     visits = api_visits
 
-            # Never let visits go backwards
             self.current_visits = max(self.current_visits, visits)
 
-            # Active players across all public servers (paginated)
             cursor = ""
             while True:
                 servers_url = f"https://games.roblox.com/v1/games/{self.place_id}/servers/Public?sortOrder=Asc&limit=100"
@@ -168,17 +185,14 @@ class MilestoneBot:
 
         except Exception as e:
             logging.error(f"Error fetching game data: {e}")
-            # Conservative fallbacks
             return random.randint(10, 25), max(3258, self.current_visits)
 
     async def send_milestone_update(self):
         if not self.target_channel or not self.is_running:
             return
 
-        # run blocking I/O in a worker thread
         players, visits = await asyncio.to_thread(self.get_game_data)
 
-        # auto-advance milestone goal smoothly (>=5% or at least +100)
         if visits >= self.milestone_goal:
             self.milestone_goal = visits + max(100, int(visits * 0.05))
 
@@ -196,7 +210,6 @@ class MilestoneBot:
             logging.error(f"Failed to send Discord message: {e}")
 
     async def _milestone_loop_body(self):
-        # small jitter to avoid hitting exact 65s cadence forever (helps if many bots run)
         await asyncio.sleep(random.uniform(0.2, 1.2))
         await self.send_milestone_update()
 
@@ -207,7 +220,7 @@ class MilestoneBot:
 if __name__ == "__main__":
     keep_alive()
     token = os.getenv("DISCORD_TOKEN")
-    place_id = "125760703264498"  # your Roblox place ID
+    place_id = "125760703264498"
     if not token:
         print("Error: DISCORD_TOKEN not found")
         raise SystemExit(1)
